@@ -1,0 +1,18 @@
+command:
+  - streamlit
+  - run
+  - app.py
+  - --server.port
+  - "8501"
+  - --server.address
+  - "0.0.0.0"
+
+env:
+  - name: SERVING_ENDPOINT
+    value: "rm-agent-endpoint"
+  - name: DATABRICKS_HOST
+    valueFrom:
+      secretRef: databricks-host
+  - name: DATABRICKS_TOKEN
+    valueFrom:
+      secretRef: databricks-token
