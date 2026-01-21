@@ -3,6 +3,496 @@
 ---
 
 ABC
+import tempfile
+
+from dotenv import load_dotenv
+from gen_ai_hub.proxy.native.amazon.clients import Session
+from botocore.exceptions import ClientError
+from pathlib import Path
+import logging
+from logger_setup import get_logger
+from env_config import MODEL_ID, IMAGE_EXTENSIONS
+import tenacity
+from typing import List, Dict
+import re
+import os
+from destination_srv import get_destination_service_credentials, generate_token, fetch_destination_details, \
+    extract_aicore_credentials
+import requests
+import json
+import time
+from api_client import fetch_bank_details_from_odata
+
+from db_connection import get_db_connection
+
+# Configure logging
+# logging.basicConfig(level=logging.INFO,
+#                    format='%(asctime)s - %(levelname)s - %(message)s')
+# logger = logging.getLogger(__name__)
+logger=get_logger()
+
+# Initialize AIC Credentials
+logger.info("====>image_processor.py -> AIC CREDENTIALS <====")
+
+load_dotenv()
+
+vcap_services=os.environ.get("VCAP_SERVICES")
+destination_service_credentials=get_destination_service_credentials(vcap_services)
+
+try:
+    oauth_token=generate_token(
+        uri = destination_service_credentials['dest_auth_url'] + "/oauth/token",
+        client_id = destination_service_credentials['clientid'],
+        client_secret = destination_service_credentials['clientsecret']
+    )
+except requests.exceptions.HTTPError as e:
+    if e.response is not None and e.response.status_code == 500:
+        raise Exception("HTTP 500: Check if the client secret is correct.") from e
+    else:
+        raise
+
+AIC_CREDENTIALS=None
+dest_AIC="GENAI_AI_CORE"
+aicore_details=fetch_destination_details(
+    destination_service_credentials['dest_base_url'],
+    dest_AIC,
+    oauth_token
+)
+AIC_CREDENTIALS=extract_aicore_credentials(aicore_details)
+
+from gen_ai_hub.proxy import GenAIHubProxyClient
+logger.info(f"AIC Credentials: {json.dumps(AIC_CREDENTIALS)}")
+
+proxy_client=GenAIHubProxyClient(
+            base_url = AIC_CREDENTIALS['aic_base_url'],
+            auth_url = AIC_CREDENTIALS['aic_auth_url'],
+            client_id = AIC_CREDENTIALS['clientid'],
+            client_secret = AIC_CREDENTIALS['clientsecret'],
+            resource_group = AIC_CREDENTIALS['resource_group']
+)
+
+
+def get_bedrock_client_with_proxy(model_id: str, creds: dict):
+    proxy_client = GenAIHubProxyClient(
+        base_url = creds['aic_base_url'],
+        auth_url = creds['aic_auth_url'],
+        client_id = creds['clientid'],
+        client_secret = creds['clientsecret'],
+        resource_group = creds['resource_group']
+    )
+
+    session = Session()
+    return session.client(model_name=model_id, proxy_client=proxy_client)
+
+@tenacity.retry(
+    stop=tenacity.stop_after_attempt(3),
+    wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
+    retry=tenacity.retry_if_exception_type(ClientError),
+    before_sleep=lambda retry_state: logger.info(
+        f"Retrying Bedrock API call (attempt {retry_state.attempt_number})..."
+    )
+)
+def generate_image_conversation(bedrock_client, model_id: str, input_text: str, input_image: Path) -> str:
+    """
+    Sends a message with text and image to a Bedrock model and returns the text response.
+    
+    Args:
+        bedrock_client: The Boto3 Bedrock runtime client.
+        model_id: The model ID to use.
+        input_text: The text prompt accompanying the image.
+        input_image: The path to the input image.
+    
+    Returns:
+        str: The text response from the model.
+    
+    Raises:
+        ValueError: If the image format is unsupported.
+        FileNotFoundError: If the image file cannot be read.
+        Exception: For other unexpected errors during API call.
+    """
+    try:
+        # Validate image extension
+        image_ext = input_image.suffix.lstrip(".").lower()
+        
+        if image_ext not in IMAGE_EXTENSIONS:
+            logger.error(f"Unsupported image format: {image_ext}")
+            raise ValueError(f"Unsupported image format: {image_ext}. Supported formats: {IMAGE_EXTENSIONS}")
+
+        # Read image as bytes
+        with input_image.open("rb") as f:
+            image = f.read()
+
+        message = {
+            "role": "user",
+            "content": [
+                {"text": input_text},
+                {
+                    "image": {
+                        "format": image_ext,
+                        "source": {"bytes": image}
+                    }
+                }
+            ]
+        }
+
+        # Send the message to Bedrock
+        response = bedrock_client.converse(
+            modelId=model_id,
+            messages=[message]
+        )
+        
+        # Extract text from response
+        output_message = response['output']['message']
+        result_text = ""
+        for content in output_message['content']:
+            if 'text' in content:
+                result_text += content['text'] + "\n"
+        
+        logger.info(f"Successfully processed image: {input_image}")
+        return result_text.strip()
+
+    except FileNotFoundError:
+        logger.error(f"Image file not found: {input_image}")
+        raise
+    except ValueError as ve:
+        logger.error(f"Invalid image: {str(ve)}")
+        raise
+    except Exception as e:
+        logger.error(f"Error processing image {input_image}: {str(e)}")
+        raise
+
+def normalize_period_for_db(quarter: str) -> str:
+    """
+    Convert '1Q25' / '1Q' + '25' like variants to 'Q1 2025' for HANA PERIOD column.
+    Assumes quarter like '1Q25' or 'Q1 2025' or already normalized.
+    """
+    q = quarter.strip().upper().replace("'", "")
+    # Already like 'Q1 2025'
+    if re.match(r"^Q[1-4]\s+20\d{2}$", q):
+        return q
+    # Match 1Q25 or 1Q'25
+    m = re.match(r"^([1-4])Q\s*'?(\d{2})$", q) or re.match(r"^([1-4])Q(\d{2})$", q)
+    if m:
+        num = m.group(1)
+        yy  = int(m.group(2))
+        yyyy = 2000 + yy
+        return f"Q{num} {yyyy}"
+    # Match Q1 25 / Q1-25
+    m = re.match(r"^Q([1-4])[\s\-]?(\d{2})$", q)
+    if m:
+        num = m.group(1)
+        yy  = int(m.group(2))
+        yyyy = 2000 + yy
+        return f"Q{num} {yyyy}"
+    # Fallback: if looks like 'Q1' only, pin to current year
+    m = re.match(r"^Q([1-4])$", q)
+    if m:
+        from datetime import datetime
+        yyyy = datetime.now().year
+        return f"Q{m.group(1)} {yyyy}"
+    return q  # best-effort fallback
+
+def detect_image_ext(image_bytes: bytes, filename: str | None) -> str:
+    """
+    Return 'png' | 'jpg' | 'jpeg'. Prefer filename if valid; fall back to magic bytes.
+    """
+    # 1) trust filename if present and allowed
+    if filename:
+        ext = os.path.splitext(filename)[1].lstrip(".").lower()
+        if ext in IMAGE_EXTENSIONS:
+            return ext
+        # common alias: treat 'jpg'/'jpeg' uniformly
+        if ext == "jpg" and "jpg" in IMAGE_EXTENSIONS:
+            return "jpg"
+        if ext == "jpeg" and "jpeg" in IMAGE_EXTENSIONS:
+            return "jpeg"
+
+    # 2) sniff magic numbers
+    sig = image_bytes[:8]
+    if sig[:3] == b"\xff\xd8\xff":
+        # choose one consistently; Bedrock typically accepts 'jpeg'
+        return "jpeg" if "jpeg" in IMAGE_EXTENSIONS else "jpg"
+    if sig.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+
+    # 3) fallback
+    return "png"
+
+
+def process_images(folder_path: str, user_prompt: str = "") -> List[Dict[str, str]]:
+    """
+    Loads images from a folder, filters them based on bank code and quarter from user prompt,
+    processes each with the LLM using combined default and user prompts,
+    prints the response, and returns the responses.
+    
+    Args:
+        folder_path: Path to the folder containing images.
+        user_prompt: User-provided prompt containing bank name and quarter details, combined with the default prompt.
+    
+    Returns:
+        List[Dict[str, str]]: A list of dictionaries, each containing the image path and its analysis.
+    """
+    # Define default prompt
+    default_prompt = """
+    Summarize the details with meaningful insights in a concise paragraph format:
+    Include Stock Price movement in Percentage with closing stock price and timestamp.
+    Stock Insights by identifying meaningful Key phases along with timestamp.
+    Concisely explain these key phases with all indicators (price, volume, On Balance Volume, Money Flow Index) and numbers
+    """
+    
+    
+    # Combine prompts
+    combined_prompt = default_prompt
+    if user_prompt.strip():
+        combined_prompt += "\n" + user_prompt.strip()
+
+    # Extract bank name and quarter from user_prompt
+    bank_code = None
+    quarter = None
+    known_banks = fetch_bank_details_from_odata()
+
+    # Try structured prompt format with fix for both "Ban:" and "Bank:"
+    bank_match = re.search(r'[Bb]an[k]?:\s*([^\n,]+)', user_prompt)
+    
+    # Look for both "Period:" and "Quarter:" in the prompt
+    period_match = re.search(r'(?:[Pp]eriod|[Qq]uarter):\s*([^\n,]+)', user_prompt)
+
+    if bank_match:
+        bank_name = bank_match.group(1).strip()
+        
+        # Try exact match first
+        for code, name in known_banks.items():
+            if bank_name.lower() == name.lower():
+                bank_code = code
+                break
+                
+        # If no exact match, try code match
+        if not bank_code:
+            for code, name in known_banks.items():
+                if bank_name.lower() == code.lower():
+                    bank_code = code
+                    break
+                    
+        # If still no match, try contains match
+        if not bank_code:
+            for code, name in known_banks.items():
+                if bank_name.lower() in name.lower() or name.lower() in bank_name.lower():
+                    bank_code = code
+                    break
+
+    if period_match:
+        period = period_match.group(1).strip()
+        
+        # More flexible quarter format handling
+        quarter_match = re.search(r'(?:q)?([1-4])[- ]?q[- ]?(?:20)?([0-9]{2})|([1-4])q(?:\')?([0-9]{2})', 
+                                 period, re.IGNORECASE)
+        
+        if quarter_match:
+            if quarter_match.group(1) and quarter_match.group(2):  # e.g., "Q1 2025" or "Q1-25"
+                quarter = f"{quarter_match.group(1)}Q{quarter_match.group(2)}"
+            elif quarter_match.group(3) and quarter_match.group(4):  # e.g., "1Q25" or "1Q'25"
+                quarter = f"{quarter_match.group(3)}Q{quarter_match.group(4)}"
+        else:
+            # Try to directly extract numbers
+            numbers = re.findall(r'\d+', period)
+            if len(numbers) >= 2:
+                # Assume first number is quarter, second is year
+                quarter_num = numbers[0][-1]  # Get last digit if multiple digits
+                year = numbers[1][-2:] if len(numbers[1]) > 2 else numbers[1]  # Get last 2 digits if longer
+                quarter = f"{quarter_num}Q{year}"
+            elif len(numbers) == 1 and 'q' in period.lower():
+                # Try to handle formats like 'Q1'
+                q_match = re.search(r'q([1-4])', period.lower())
+                if q_match:
+                    quarter_num = q_match.group(1)
+                    # Default to current year if only quarter is specified
+                    import datetime
+                    current_year = str(datetime.datetime.now().year)[-2:]
+                    quarter = f"{quarter_num}Q{current_year}"
+
+    # Fallback to free-form prompt if structured format not found
+    if not bank_code or not quarter:
+        prompt_lower = user_prompt.lower()
+
+        if not bank_code:
+            for code, name in known_banks.items():
+                # Check full word match for bank name
+                if re.search(rf'\b{re.escape(name.lower())}\b', prompt_lower):
+                    bank_code = code
+                    break
+                # Check full word match for bank code
+                elif re.search(rf'\b{re.escape(code.lower())}\b', prompt_lower):
+                    bank_code = code
+                    break
+        
+        # Find quarter
+        if not quarter:
+            # More comprehensive pattern for various quarter formats
+            quarter_patterns = [
+                r'(?:q)?([1-4])[- ]?q[- ]?(?:20)?([0-9]{2})',  # Q1 2025, Q1-25, 1Q 25
+                r'([1-4])q(?:\')?([0-9]{2})',                  # 1Q25, 1Q'25
+                r'q([1-4])[\s\-\/](?:20)?([0-9]{2})',          # Q1/25, Q1-2025
+                r'(?:20)?([0-9]{2})[\s\-\/]q([1-4])'           # 25-Q1, 2025/Q1
+            ]
+            
+            for pattern in quarter_patterns:
+                quarter_match = re.search(pattern, prompt_lower)
+                if quarter_match:
+                    if quarter_match.group(1) and quarter_match.group(2):
+                        # Check if first group is year or quarter
+                        if len(quarter_match.group(1)) >= 2:  # Likely a year
+                            quarter = f"{quarter_match.group(2)}Q{quarter_match.group(1)[-2:]}"
+                        else:  # Likely a quarter
+                            quarter = f"{quarter_match.group(1)}Q{quarter_match.group(2)}"
+                        break
+            
+            # If still not found, try to find any numbers and 'q' in the prompt
+            if not quarter:
+                q_positions = [m.start() for m in re.finditer(r'q', prompt_lower)]
+                
+                for pos in q_positions:
+                    # Look for digits before and after 'q'
+                    before = prompt_lower[max(0, pos-5):pos]
+                    after = prompt_lower[pos+1:min(len(prompt_lower), pos+6)]
+                    
+                    # Try to extract quarter number and year
+                    before_digits = re.findall(r'\d+', before)
+                    after_digits = re.findall(r'\d+', after)
+                    
+                    if after_digits and len(after_digits[0]) <= 2 and int(after_digits[0]) <= 4:
+                        # Format like "Q1"
+                        quarter_num = after_digits[0]
+                        # Default to current year
+                        import datetime
+                        current_year = str(datetime.datetime.now().year)[-2:]
+                        quarter = f"{quarter_num}Q{current_year}"
+                        break
+                    elif before_digits and len(before_digits[-1]) <= 2 and int(before_digits[-1]) <= 4:
+                        # Format like "1Q"
+                        quarter_num = before_digits[-1]
+                        # Look for year after
+                        import datetime
+                        year = after_digits[0][-2:] if after_digits else str(datetime.datetime.now().year)[-2:]
+                        quarter = f"{quarter_num}Q{year}"
+                        break
+
+    # Try to extract quarter directly from the prompt as a last resort
+    if not quarter:
+        # Look for "1Q25" or similar patterns directly in the prompt
+        direct_quarter_match = re.search(r'([1-4])Q[\'"]?(\d{2})', user_prompt, re.IGNORECASE)
+        if direct_quarter_match:
+            quarter = f"{direct_quarter_match.group(1)}Q{direct_quarter_match.group(2)}"
+        else:
+            # Look for Q1 followed by 2025 or 25
+            q_year_match = re.search(r'Q([1-4])[^0-9]*(?:20)?(\d{2})', user_prompt, re.IGNORECASE)
+            if q_year_match:
+                quarter = f"{q_year_match.group(1)}Q{q_year_match.group(2)}"
+            else:
+                # Check for a number 1-4 followed by digit(s) that could be a year
+                num_year_match = re.search(r'[^0-9]([1-4])[^0-9]*(\d{2,4})', user_prompt)
+                if num_year_match:
+                    year = num_year_match.group(2)[-2:]  # Get last 2 digits of year
+                    quarter = f"{num_year_match.group(1)}Q{year}"
+                else:
+                    # If user prompt contains both "Q1" and "2025" separately
+                    q_match = re.search(r'Q([1-4])', user_prompt, re.IGNORECASE)
+                    year_match = re.search(r'(?:20)?(\d{2})', user_prompt)
+                    if q_match and year_match:
+                        quarter = f"{q_match.group(1)}Q{year_match.group(1)[-2:]}"
+                    else:
+                        # Absolute fallback: if we have a bank but no quarter, use simple heuristics
+                        for i in range(1, 5):
+                            if f"q{i}" in user_prompt.lower() or f"q {i}" in user_prompt.lower():
+                                import datetime
+                                current_year = str(datetime.datetime.now().year)[-2:]
+                                quarter = f"{i}Q{current_year}"
+                                break
+    logger.info(
+        f"[Bank Extraction] Identified bank_code: '{bank_code}', quarter: '{quarter}' from user prompt: '{user_prompt}'")
+
+    if not bank_code:
+        logger.warning(f"Could not identify bank in prompt: {user_prompt}")
+        return []
+        
+    if not quarter:
+        logger.warning(f"Could not identify quarter in prompt: {user_prompt}")
+        return []
+
+    # ----- NEW: fetch image(s) from HANA instead of scanning folder -----
+    period_db = normalize_period_for_db(quarter)
+    rows = []
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Primary: exact match (BANK, PERIOD as normalized e.g. "Q1 2025")
+        cursor.execute("""
+            SELECT IMAGE_FILE, FILENAME
+            FROM CONTENT_INGESTION_IMAGES
+            WHERE BANK = ? AND PERIOD = ?
+        """, (bank_code, period_db))
+        rows = cursor.fetchall()
+
+        # Fallback #1: PERIOD stored as raw quarter (e.g., "1Q25")
+        if not rows:
+            cursor.execute("""
+                SELECT IMAGE_FILE, FILENAME
+                FROM CONTENT_INGESTION_IMAGES
+                WHERE BANK = ? AND PERIOD = ?
+            """, (bank_code, quarter))
+            rows = cursor.fetchall()
+
+        # Fallback #2: PERIOD stored with apostrophe (e.g., "1Q'25")
+        if not rows:
+            alt_q = quarter.replace("Q", "Q'")
+            cursor.execute("""
+                SELECT IMAGE_FILE, FILENAME
+                FROM CONTENT_INGESTION_IMAGES
+                WHERE BANK = ? AND PERIOD = ?
+            """, (bank_code, alt_q))
+            rows = cursor.fetchall()
+
+        cursor.close()
+
+    except Exception as e:
+        logger.error(f"[HANA Fetch Error] {str(e)}", exc_info=True)
+        return []
+
+    if not rows:
+        logger.warning(
+            f"No images found in HANA for bank='{bank_code}', period='{period_db}' (from '{quarter}')"
+        )
+        return []
+
+    # ----- Create Bedrock client and process images -----
+    try:
+        bedrock_client = get_bedrock_client_with_proxy(MODEL_ID, AIC_CREDENTIALS)
+    except Exception as e:
+        logger.error(f"Failed to create Bedrock client: {str(e)}")
+        return []
+
+    results: List[Dict[str, str]] = []
+
+    for image_bytes, filename in rows:
+        # write to temp file so generate_image_conversation(Path) stays unchanged
+        ext = detect_image_ext(image_bytes, filename)  # 'png' | 'jpg' | 'jpeg'
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmpf:
+            tmpf.write(image_bytes)
+            tmp_path = Path(tmpf.name)
+
+        try:
+            resp = generate_image_conversation(bedrock_client, MODEL_ID, combined_prompt, tmp_path)
+            logger.info(f"Analyzed image from HANA: {filename}")
+            results.append({"image_path": filename or str(tmp_path), "analysis": resp})
+        except Exception as e:
+            logger.error(f"Failed to process {filename or tmp_path.name}: {str(e)}")
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    return results
 
 ## Table of Contents
 
